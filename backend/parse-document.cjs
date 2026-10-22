@@ -4,26 +4,42 @@ const {pathToFileURL}=require('node:url');
 const {extractHTML}=require('./html-text.cjs');
 const {safeHTML}=require('./library-store.cjs');
 const {CODE}=require('./classify.cjs');
-const MAX_BYTES=64*1024*1024,MAX_CHARS=1000000;
+const {loadLimits}=require('./limits.cjs');
+const MAX_CHARS=1000000,PARSER_BUFFER_BYTES=512*1024*1024;
 const esc=s=>String(s).replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 const plainHTML=text=>text.split(/\n\s*\n/).filter(Boolean).map(p=>'<p>'+esc(p).replace(/\n/g,'<br>')+'</p>').join('\n');
-function decodeText(buffer){
+function decodeText(buffer,hasTail=false){
   if(buffer[0]===0xff&&buffer[1]===0xfe)return buffer.subarray(2).toString('utf16le');
   if(buffer[0]===0xfe&&buffer[1]===0xff)return new TextDecoder('utf-16be').decode(buffer.subarray(2));
-  try{return new TextDecoder('utf-8',{fatal:true}).decode(buffer);}catch{return new TextDecoder('gb18030').decode(buffer);}
+  try{return new TextDecoder('utf-8',{fatal:true}).decode(buffer,{stream:hasTail});}catch{return new TextDecoder('gb18030').decode(buffer,{stream:hasTail});}
 }
-async function parseDocument(file,name){
+function completeHTMLPrefix(raw){
+  return raw.replace(/<!--[\s\S]*?(?:-->|$)/g,'').replace(/<(script|style|noscript)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi,(block,tag)=>new RegExp('</'+tag+'\\s*>$','i').test(block)?block:'').replace(/<[^>]*$/,'');
+}
+async function parseDocument(file,name,{maxBytes=loadLimits().maxParseBytes,bufferBudgetBytes=PARSER_BUFFER_BYTES}={}){
   const ext=path.extname(name).slice(1).toLowerCase(),size=(await fs.stat(file)).size;
   const handle=await fs.open(file,'r'),head=Buffer.alloc(12);try{await handle.read(head,0,12,0);}finally{await handle.close();}
   let format=ext,text='',html='',warnings=[];
   if(head.subarray(0,5).toString()==='%PDF-')format='pdf';
   if(format==='zip'||['rar','7z','mp4','webm','mp3','wav','png','jpg','jpeg','gif'].includes(format))return {status:'saved_only',format,message:format==='zip'?'ZIP 原包已保存，按当前设置不自动展开。':'原件已保存，该格式当前不提取正文。',text:'',html:''};
-  if(size>MAX_BYTES)return {status:'saved_only',format,message:'原件已保存；单份文档超过 64 MB 本地解析上限，请拆分后重试。',text:'',html:''};
-  const binary=await fs.readFile(file);
+  if(maxBytes&&size>maxBytes)return {status:'saved_only',format,message:'原件已保存；超过当前服务配置的自动解析文件大小上限。',text:'',html:''};
   const ole=head.subarray(0,8).equals(Buffer.from('d0cf11e0a1b11ae1','hex'));
+  if(ole&&format!=='doc')return {status:'saved_only',format,message:'旧版二进制 Office 原件已保存；请另存为 DOCX、PPTX 或 XLSX 后上传解析。',text:'',html:''};
   const officeTypes=new Set(['pdf','docx','pptx','xlsx','odt','odp','ods','rtf']);
+  const isOffice=ole||officeTypes.has(format)||head.subarray(0,2).toString()==='PK';
+  const isText=!isOffice&&(CODE.test(name)||['txt','md','markdown','tex','bib','csv','tsv','json','html','htm','srt','vtt'].includes(format));
+  if(!isOffice&&!isText)return {status:'saved_only',format,message:'原件已保存，该格式当前不提取正文。',text:'',html:''};
+  // Binary parsers need a whole-file Buffer, which the V8 heap limit does not bound.
+  // Reserve at most a quarter of currently available memory, within the input-buffer budget.
+  const available=Math.min(require('node:os').freemem(),typeof process.availableMemory==='function'?process.availableMemory():Infinity);
+  if(isOffice&&size>Math.min(bufferBudgetBytes,Math.floor(available/4)))return {status:'saved_only',format,message:'原件已保存；此格式需要整份载入内存，超过当前解析内存预算，请拆分文档后重试。',text:'',html:''};
+  // Read only the prefix needed for the searchable-text budget, even for multi-GB text files.
+  // The full original stays on disk; this is a body-preview budget, not an upload limit.
+  const textBudget=(MAX_CHARS+1)*4,hasTail=isText&&size>textBudget;
+  let binary;
+  if(hasTail){const source=await fs.open(file,'r');try{binary=Buffer.alloc(textBudget);const {bytesRead}=await source.read(binary,0,textBudget,0);binary=binary.subarray(0,bytesRead);}finally{await source.close();}}
+  else binary=await fs.readFile(file);
   if(ole){
-    if(format!=='doc')return {status:'saved_only',format,message:'旧版二进制 Office 原件已保存；请另存为 DOCX、PPTX 或 XLSX 后上传解析。',text:'',html:''};
     const WordExtractor=require('word-extractor');const doc=await new WordExtractor().extract(binary);text=doc.getBody()+'\n'+doc.getTextboxes({includeHeadersAndFooters:false});html=plainHTML(text);format='doc';
   }else if(officeTypes.has(format)||head.subarray(0,2).toString()==='PK'&&format!=='zip'){
     const office=require('officeparser');
@@ -34,16 +50,16 @@ async function parseDocument(file,name){
     warnings=(ast.warnings||[]).map(w=>w.code||w.type||'').filter(Boolean);
     if(text.length<=MAX_CHARS){try{html=String((await ast.to('html',{allowRemoteAssets:false,includeImages:'none',includeFormatting:false,htmlConfig:{renderMetadata:false}})).value||'');}catch{html=plainHTML(text);}}
   }else if(CODE.test(name)||['txt','md','markdown','tex','bib','csv','tsv','json','html','htm','srt','vtt'].includes(format)){
-    const raw=decodeText(binary);if(raw.includes('\0'))return {status:'error',format,message:'文件内容与文本格式不符；原件已保留，请核对文件格式。',text:'',html:''};
-    text=/^html?$/.test(format)?extractHTML(raw):raw;
+    const raw=decodeText(binary,hasTail);if(raw.includes('\0'))return {status:'error',format,message:'文件内容与文本格式不符；原件已保留，请核对文件格式。',text:'',html:''};
+    text=/^html?$/.test(format)?extractHTML(hasTail?completeHTMLPrefix(raw):raw):raw;
     if(CODE.test(name))html='<pre data-language="'+({py:'python',m:'matlab',r:'r',js:'javascript',json:'json',sh:'bash'}[format]||'')+'"><code>'+esc(text.slice(0,MAX_CHARS))+'</code></pre>';
     else if(['md','markdown'].includes(format)){
-      const office=require('officeparser');const ast=await office.parseOffice(Buffer.from(raw),{fileType:'md',ocr:false,allowRemoteAssets:false,extractAttachments:false});html=String((await ast.to('html',{allowRemoteAssets:false,includeImages:'none',includeFormatting:false})).value||'');
+      const office=require('officeparser');const ast=await office.parseOffice(Buffer.from(raw.slice(0,MAX_CHARS)),{fileType:'md',ocr:false,allowRemoteAssets:false,extractAttachments:false});html=String((await ast.to('html',{allowRemoteAssets:false,includeImages:'none',includeFormatting:false})).value||'');
     }else html=plainHTML(text.slice(0,MAX_CHARS));
   }else return {status:'saved_only',format,message:'原件已保存，该格式当前不提取正文。',text:'',html:''};
   text=text.replace(/\u0000/g,'').replace(/\r\n/g,'\n').trim();
-  if(!text.replace(/[\s\u200b-\u200f]/g,''))return {status:format==='pdf'?'needs_ocr':'saved_only',format,message:format==='pdf'?'未提取到文字层，可能是扫描件；已保留 PDF 预览，需要 OCR 后才能搜索正文。':'未提取到可读正文，原件已保存。',text:'',html:''};
-  const truncated=text.length>MAX_CHARS||warnings.some(w=>/LIMIT|TRUNCATED|NOT_READ|PAGE_LOAD_FAILED|TEXT_ENCODING_SUSPECT/i.test(w));
+  if(!text.replace(/[\s\u200b-\u200f]/g,''))return {status:hasTail?'partial':format==='pdf'?'needs_ocr':'saved_only',format,message:hasTail?'原件已保存；本次读取的正文片段未找到可读文字，后续内容请下载原件阅读。':format==='pdf'?'未提取到文字层，可能是扫描件；已保留 PDF 预览，需要 OCR 后才能搜索正文。':'未提取到可读正文，原件已保存。',text:'',html:''};
+  const truncated=hasTail||text.length>MAX_CHARS||warnings.some(w=>/LIMIT|TRUNCATED|NOT_READ|PAGE_LOAD_FAILED|TEXT_ENCODING_SUSPECT/i.test(w));
   if(text.length>MAX_CHARS){text=text.slice(0,MAX_CHARS);html=plainHTML(text);}
   html=safeHTML(html||plainHTML(text));
   return {status:truncated?'partial':'ready',format,text,html,message:truncated?'已提取部分正文；存在内容限制、页面缺失或文字编码异常，请结合原件阅读。':`已提取 ${text.length.toLocaleString('zh-CN')} 字可检索正文。`,warningCount:warnings.length};
@@ -54,4 +70,4 @@ function parseError(error){
   if(/LIMIT|TOO_LARGE|MEMORY/i.test(code+' '+message))return '文档超出本地解析资源限制，原件已保留；请拆分后重试。';
   return '正文解析未成功，原件已保留；请核对文件是否损坏、格式是否正确，或重新解析。';
 }
-module.exports={parseDocument,parseError,MAX_BYTES,MAX_CHARS,plainHTML};
+module.exports={parseDocument,parseError,MAX_CHARS,plainHTML};

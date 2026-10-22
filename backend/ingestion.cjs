@@ -2,7 +2,7 @@
 const path=require('node:path'),{Worker}=require('node:worker_threads');
 const {classify,associations,kindFor}=require('./classify.cjs');
 class IngestionQueue{
-  constructor(store,{timeoutMs=120000}={}){this.store=store;this.timeoutMs=timeoutMs;this.active=null;this.closed=false;store.db.prepare("UPDATE library_ingestion SET status='queued' WHERE status='parsing'").run();this.kick();}
+  constructor(store,{timeoutMs=120000,maxParseBytes=0}={}){this.store=store;this.timeoutMs=timeoutMs;this.maxParseBytes=maxParseBytes;this.active=null;this.closed=false;store.db.prepare("UPDATE library_ingestion SET status='queued' WHERE status='parsing'").run();this.kick();}
   enqueue(id,{mode='manual'}={}){
     const r=this.store.db.prepare('SELECT title,category FROM library_resources WHERE id=?').get(id);if(!r)return;
     const c=classify(r.title);this.store.db.prepare(`INSERT INTO library_ingestion(resource_id,status,category_mode,confidence,needs_review,reason,updated_at) VALUES(?,'queued',?,?,?,?,?) ON CONFLICT(resource_id) DO UPDATE SET status='queued',message='',updated_at=excluded.updated_at`).run(id,mode,mode==='manual'?'manual':c.confidence,mode==='manual'?0:1,mode==='manual'?'按手动指定分类保存。':c.reason,new Date().toISOString());this.kick();
@@ -15,7 +15,7 @@ class IngestionQueue{
     let result;
     try{
       const file=path.resolve(this.store.dir,row.path);if(!file.startsWith(this.store.dir+path.sep))throw new Error('invalid path');
-      const worker=new Worker(path.join(__dirname,'parse-worker.cjs'),{workerData:{file,name:row.name},resourceLimits:{maxOldGenerationSizeMb:512,stackSizeMb:8},stdout:true,stderr:true});
+      const worker=new Worker(path.join(__dirname,'parse-worker.cjs'),{workerData:{file,name:row.name,maxBytes:this.maxParseBytes},resourceLimits:{maxOldGenerationSizeMb:512,stackSizeMb:8},stdout:true,stderr:true});
       this.active.worker=worker;worker.stdout.resume();worker.stderr.resume();
       result=await new Promise(resolve=>{let done=false;const finish=r=>{if(done)return;done=true;clearTimeout(timer);resolve(r);};const fail=message=>finish({status:'error',text:'',html:'',format:'',message});const timer=setTimeout(()=>fail('解析超过 120 秒，原件已保留；请拆分文档或重新解析。'),this.timeoutMs);worker.once('message',finish);worker.once('error',()=>fail('解析进程异常或资源不足，原件已保留，请拆分后重试。'));worker.once('exit',()=>fail('解析进程提前结束，原件已保留，请重新解析。'));});
       await worker.terminate();

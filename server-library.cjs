@@ -5,6 +5,7 @@ const {LibraryStore}=require('./backend/library-store.cjs');
 const {CATEGORIES,AppError}=require('./backend/domain.cjs');
 const {classify,kindFor}=require('./backend/classify.cjs');
 const {IngestionQueue}=require('./backend/ingestion.cjs');
+const {loadLimits,uploadLimit}=require('./backend/limits.cjs');
 const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf','.bcmap':'application/octet-stream','.wasm':'application/wasm','.icc':'application/octet-stream','.pfb':'application/octet-stream'};
 function json(res,status,body){const data=Buffer.from(JSON.stringify(body));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':data.length,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(data);}
 function rangeOf(header,size){
@@ -13,19 +14,19 @@ function rangeOf(header,size){
   if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||start>=size||end<start)return false;return {start,end};
 }
 async function bodyJSON(req){let bytes=0;const parts=[];for await(const x of req){bytes+=x.length;if(bytes>1024*1024)throw new AppError(413,'信息过长。');parts.push(x);}try{return JSON.parse(Buffer.concat(parts).toString('utf8'));}catch{throw new AppError(400,'请求格式无效。');}}
-function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirname,ingestionOptions={}}={}){
+function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirname,ingestionOptions={},limits=loadLimits()}={}){
   const store=new LibraryStore(dataDir);
-  const ingestion=new IngestionQueue(store,ingestionOptions);
+  const ingestion=new IngestionQueue(store,{...ingestionOptions,maxParseBytes:limits.maxParseBytes});
   const staticFiles=new Set(['index.html','core.js','knowledge.js','library-view.js','library-reader.js','app.js','styles.css','library.css','pdf-viewer.html','pdf-viewer.js','pdf-viewer.css','assets/favicon.svg']);
   async function upload(req,url){
     const name=url.searchParams.get('name'),requested=url.searchParams.get('category'),automatic=!requested||requested==='auto';
     if(!name||name.length>240||/[\x00-\x1f/\\]/.test(name))throw new AppError(400,'文件名无效。');if(!automatic&&!CATEGORIES.includes(requested))throw new AppError(400,'请选择自动识别或原六类中的一个分类。');
     const category=automatic?classify(name).category:requested;
-    const ext=path.extname(name).toLowerCase();const textType=/\.(txt|md|markdown|html?|py|r|m|tex|js|ts|tsx|jsx|c|cpp|h|java|jl|sql|sh|ipynb|json|csv|tsv|bib|srt|vtt)$/i.test(name);const max=textType?20*1024*1024:1024*1024*1024;
-    const declared=Number(req.headers['content-length']);if(declared>max)throw new AppError(413,'文件过大，请先拆分后导入。');
+    const ext=path.extname(name).toLowerCase(),max=uploadLimit(limits,name);
+    const declared=Number(req.headers['content-length']);if(max&&declared>max)throw new AppError(413,'文件超过当前服务配置的上传大小上限。');
     const tmp=path.join(store.dir,'tmp',crypto.randomUUID()+'.part'),hash=crypto.createHash('sha256');let size=0;
     try{
-      await pipeline(req,new Transform({transform(chunk,enc,cb){size+=chunk.length;if(size>max)return cb(new AppError(413,'文件超过导入上限。'));hash.update(chunk);cb(null,chunk);}}),fs.createWriteStream(tmp,{flags:'wx'}));
+      await pipeline(req,new Transform({transform(chunk,enc,cb){size+=chunk.length;if(max&&size>max)return cb(new AppError(413,'文件超过当前服务配置的上传大小上限。'));hash.update(chunk);cb(null,chunk);}}),fs.createWriteStream(tmp,{flags:'wx'}));
       if(!size)throw new AppError(400,'文件为空。');const sha=hash.digest('hex');
       const sourceKey='upload:'+sha;
       const id='kb_'+crypto.createHash('sha256').update(sourceKey).digest('hex').slice(0,32),assetId='asset_'+sha;
@@ -55,7 +56,7 @@ function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirn
       const host=String(req.headers.host||'');if(!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(host))throw new AppError(403,'此版本在本机运行。');
       if(!['GET','HEAD'].includes(req.method)&&req.headers.origin&&!['http://'+host,'http://localhost:'+server.address().port,'http://127.0.0.1:'+server.address().port].includes(req.headers.origin))throw new AppError(403,'拒绝跨网站写入。');
       const url=new URL(req.url,'http://'+host);let match;
-      if(url.pathname==='/health'&&req.method==='GET')return json(res,200,{app:'MathModel AI',version:'1.3.0',mode:'library-reading',automaticIngestion:true,ragflowEnabled:false,agentEnabled:false});
+      if(url.pathname==='/health'&&req.method==='GET')return json(res,200,{app:'MathModel AI',version:'1.3.1',mode:'library-reading',automaticIngestion:true,fileSizeLimits:limits,ragflowEnabled:false,agentEnabled:false});
       if(url.pathname==='/api/library/stats'&&req.method==='GET')return json(res,200,store.stats());
       if(url.pathname==='/api/library/ingestion'&&req.method==='GET')return json(res,200,store.ingestionList());
       if(url.pathname==='/api/library/resources'&&req.method==='GET')return json(res,200,store.list(Object.fromEntries(url.searchParams)));
@@ -97,7 +98,8 @@ function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirn
       throw new AppError(404,'接口或文件不存在。');
     }catch(e){if(!res.headersSent&&!res.destroyed)json(res,e.status||500,{error:e instanceof AppError?e.message:'本地资料服务处理失败。'});}
   });
-  server.requestTimeout=10*60*1000;
+  // Stream originals to disk without a fixed total upload duration.
+  server.requestTimeout=0;
   return {server,store,ingestion,async close(){await ingestion.close();if(server.listening)await new Promise(r=>server.close(r));store.close();}};
 }
 module.exports={createLibraryApp,rangeOf};

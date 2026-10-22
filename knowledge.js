@@ -2,7 +2,7 @@
 (() => {
   const M=window.MM;
   async function request(url,options={}){
-    let res;try{res=await fetch(url,{...options,signal:options.signal||AbortSignal.timeout(120000)});}catch{throw new Error('本地资料服务未响应，请使用本地启动器打开平台。');}
+    let res;try{res=await fetch(url,{...options,signal:Object.hasOwn(options,'signal')?options.signal:AbortSignal.timeout(120000)});}catch{throw new Error('本地资料服务未响应，请使用本地启动器打开平台。');}
     let data;try{data=await res.json();}catch{throw new Error('资料服务返回了无效响应。');}
     if(!res.ok)throw new Error(data.error||'资料请求未完成。');return data;
   }
@@ -16,7 +16,7 @@
       const tags=String(metadata.tags||'').split(/[,，;；\s]+/).filter(Boolean),note=String(metadata.description||'');
       if(tags.length>40||tags.some(x=>x.length>80))throw new Error('标签最多 40 个，每个不超过 80 字。');
       if(note.length>12000)throw new Error('资料说明不能超过 12,000 字。');
-      const data=await request('/api/library/resources?'+new URLSearchParams({name:file.name,category:metadata.category||'auto'}),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file,signal:AbortSignal.timeout(10*60*1000)});
+      const data=await request('/api/library/resources?'+new URLSearchParams({name:file.name,category:metadata.category||'auto'}),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file,signal:null});
       if(tags.length||note)await this.update(data.item.id,{tags,note});
       return data;
     },
