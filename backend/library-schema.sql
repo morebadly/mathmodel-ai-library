@@ -30,3 +30,11 @@ CREATE TABLE IF NOT EXISTS library_methods (
 );
 CREATE INDEX IF NOT EXISTS library_method_key ON library_methods(method_key);
 CREATE TABLE IF NOT EXISTS library_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS library_ingestion (
+ resource_id TEXT PRIMARY KEY REFERENCES library_resources(id), status TEXT NOT NULL DEFAULT 'queued',
+ format TEXT NOT NULL DEFAULT '', char_count INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '',
+ category_mode TEXT NOT NULL DEFAULT 'auto', confidence TEXT NOT NULL DEFAULT 'low',
+ needs_review INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '',
+ attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS library_ingestion_status ON library_ingestion(status,updated_at);

@@ -3,7 +3,8 @@ const http=require('node:http'),fs=require('node:fs'),fsp=fs.promises,path=requi
 const {pipeline}=require('node:stream/promises');const {Transform}=require('node:stream');
 const {LibraryStore}=require('./backend/library-store.cjs');
 const {CATEGORIES,AppError}=require('./backend/domain.cjs');
-const {extractHTML}=require('./backend/html-text.cjs');
+const {classify,kindFor}=require('./backend/classify.cjs');
+const {IngestionQueue}=require('./backend/ingestion.cjs');
 const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf','.bcmap':'application/octet-stream','.wasm':'application/wasm','.icc':'application/octet-stream','.pfb':'application/octet-stream'};
 function json(res,status,body){const data=Buffer.from(JSON.stringify(body));res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Content-Length':data.length,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(data);}
 function rangeOf(header,size){
@@ -12,31 +13,39 @@ function rangeOf(header,size){
   if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||start>=size||end<start)return false;return {start,end};
 }
 async function bodyJSON(req){let bytes=0;const parts=[];for await(const x of req){bytes+=x.length;if(bytes>1024*1024)throw new AppError(413,'信息过长。');parts.push(x);}try{return JSON.parse(Buffer.concat(parts).toString('utf8'));}catch{throw new AppError(400,'请求格式无效。');}}
-function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirname}={}){
+function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirname,ingestionOptions={}}={}){
   const store=new LibraryStore(dataDir);
+  const ingestion=new IngestionQueue(store,ingestionOptions);
   const staticFiles=new Set(['index.html','core.js','knowledge.js','library-view.js','library-reader.js','app.js','styles.css','library.css','pdf-viewer.html','pdf-viewer.js','pdf-viewer.css','assets/favicon.svg']);
   async function upload(req,url){
-    const name=url.searchParams.get('name'),category=url.searchParams.get('category');
-    if(!name||name.length>240||/[\x00-\x1f/\\]/.test(name))throw new AppError(400,'文件名无效。');if(!CATEGORIES.includes(category))throw new AppError(400,'请选择原六类中的一个分类。');
-    const ext=path.extname(name).toLowerCase();const textType=/\.(txt|md|markdown|html?|py|r|m|tex|js|json|csv|tsv|bib)$/i.test(name);const max=textType?20*1024*1024:1024*1024*1024;
+    const name=url.searchParams.get('name'),requested=url.searchParams.get('category'),automatic=!requested||requested==='auto';
+    if(!name||name.length>240||/[\x00-\x1f/\\]/.test(name))throw new AppError(400,'文件名无效。');if(!automatic&&!CATEGORIES.includes(requested))throw new AppError(400,'请选择自动识别或原六类中的一个分类。');
+    const category=automatic?classify(name).category:requested;
+    const ext=path.extname(name).toLowerCase();const textType=/\.(txt|md|markdown|html?|py|r|m|tex|js|ts|tsx|jsx|c|cpp|h|java|jl|sql|sh|ipynb|json|csv|tsv|bib|srt|vtt)$/i.test(name);const max=textType?20*1024*1024:1024*1024*1024;
     const declared=Number(req.headers['content-length']);if(declared>max)throw new AppError(413,'文件过大，请先拆分后导入。');
     const tmp=path.join(store.dir,'tmp',crypto.randomUUID()+'.part'),hash=crypto.createHash('sha256');let size=0;
     try{
       await pipeline(req,new Transform({transform(chunk,enc,cb){size+=chunk.length;if(size>max)return cb(new AppError(413,'文件超过导入上限。'));hash.update(chunk);cb(null,chunk);}}),fs.createWriteStream(tmp,{flags:'wx'}));
       if(!size)throw new AppError(400,'文件为空。');const sha=hash.digest('hex');
-      const sourceKey='upload:'+sha+':'+category;
-      const duplicate=store.db.prepare('SELECT id FROM library_resources WHERE source_key=?').get(sourceKey);if(duplicate)return {item:store.get(duplicate.id),duplicate:true};
+      const sourceKey='upload:'+sha;
       const id='kb_'+crypto.createHash('sha256').update(sourceKey).digest('hex').slice(0,32),assetId='asset_'+sha;
       const rel='files/'+sha,destination=path.join(store.dir,rel);await fsp.copyFile(tmp,destination,fs.constants.COPYFILE_EXCL).catch(e=>{if(e.code!=='EEXIST')throw e;});
-      let html='',text='';
-      if(textType){const raw=await fsp.readFile(tmp,'utf8');text=/\.html?$/i.test(name)?extractHTML(raw):raw;html='<pre><code>'+text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))+'</code></pre>';}
-      const isPDF=ext==='.pdf',kind=isPDF?(category==='优秀数学建模论文'?'论文':'PDF资料'):category==='算法与代码'?'代码':textType?'知识卡':'附件';
+      const isPDF=ext==='.pdf',kind=kindFor(category,name,isPDF?'pdf':'');
       const now=new Date().toISOString();
       store.db.exec('BEGIN IMMEDIATE');
       try{
-        store.insertResource({id,source_key:sourceKey,title:name,category,kind,availability:isPDF?'PDF原件':textType?'本地正文':'附件包',summary:text.slice(0,200)||'本地原件，可下载阅读。',body_html:html,body_text:text,tags_json:'[]',source_label:'成员导入',note:'',created_at:now,updated_at:now});
+        // Check after the asynchronous file copy, inside the same transaction as insertion.
+        // Concurrent duplicate uploads must preserve an explicit manual category.
+        const duplicate=store.db.prepare("SELECT r.id FROM library_resources r JOIN library_resource_assets ra ON ra.resource_id=r.id JOIN library_assets a ON a.id=ra.asset_id WHERE r.source_key LIKE 'upload:%' AND a.sha256=? ORDER BY r.created_at LIMIT 1").get(sha);
+        if(duplicate){
+          if(!automatic){const old=store.get(duplicate.id);store.db.prepare('UPDATE library_resources SET category=?,kind=?,updated_at=? WHERE id=?').run(category,kindFor(category,old.title,old.ingestion?.format||''),now,duplicate.id);store.db.prepare("UPDATE library_ingestion SET category_mode='manual',needs_review=0,confidence='manual',reason='按手动指定分类保存。' WHERE resource_id=?").run(duplicate.id);}
+          if(!store.get(duplicate.id).ingestion)ingestion.enqueue(duplicate.id,{mode:automatic?'auto':'manual'});
+          store.db.exec('COMMIT');return {item:store.get(duplicate.id),duplicate:true};
+        }
+        store.insertResource({id,source_key:sourceKey,title:name,category,kind,availability:isPDF?'PDF原件':'附件包',summary:'原件已保存，等待自动解析正文。',body_html:'',body_text:'',tags_json:'[]',source_label:'成员导入',note:'',created_at:now,updated_at:now});
         store.db.prepare('INSERT OR IGNORE INTO library_assets(id,sha256,path,size,mime,original_name) VALUES(?,?,?,?,?,?)').run(assetId,sha,rel,size,isPDF?'application/pdf':ext==='.txt'?'text/plain; charset=utf-8':'application/octet-stream',name);
-        store.db.prepare('INSERT OR IGNORE INTO library_resource_assets(resource_id,asset_id,label,role) VALUES(?,?,?,?)').run(id,assetId,name,'primary');store.db.exec('COMMIT');
+        store.db.prepare('INSERT OR IGNORE INTO library_resource_assets(resource_id,asset_id,label,role) VALUES(?,?,?,?)').run(id,assetId,name,'primary');
+        ingestion.enqueue(id,{mode:automatic?'auto':'manual'});store.db.exec('COMMIT');
       }catch(e){store.db.exec('ROLLBACK');throw e;}
       return {item:store.get(id),duplicate:false};
     }finally{await fsp.unlink(tmp).catch(()=>{});}
@@ -46,19 +55,28 @@ function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirn
       const host=String(req.headers.host||'');if(!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(host))throw new AppError(403,'此版本在本机运行。');
       if(!['GET','HEAD'].includes(req.method)&&req.headers.origin&&!['http://'+host,'http://localhost:'+server.address().port,'http://127.0.0.1:'+server.address().port].includes(req.headers.origin))throw new AppError(403,'拒绝跨网站写入。');
       const url=new URL(req.url,'http://'+host);let match;
-      if(url.pathname==='/health'&&req.method==='GET')return json(res,200,{app:'MathModel AI',version:'1.2.0',mode:'library-reading',ragflowEnabled:false,agentEnabled:false});
+      if(url.pathname==='/health'&&req.method==='GET')return json(res,200,{app:'MathModel AI',version:'1.3.0',mode:'library-reading',automaticIngestion:true,ragflowEnabled:false,agentEnabled:false});
       if(url.pathname==='/api/library/stats'&&req.method==='GET')return json(res,200,store.stats());
+      if(url.pathname==='/api/library/ingestion'&&req.method==='GET')return json(res,200,store.ingestionList());
       if(url.pathname==='/api/library/resources'&&req.method==='GET')return json(res,200,store.list(Object.fromEntries(url.searchParams)));
       if(url.pathname==='/api/library/resources'&&req.method==='POST')return json(res,201,await upload(req,url));
       if((match=url.pathname.match(/^\/api\/library\/resources\/(kb_[a-zA-Z0-9_-]+)$/))){
         if(req.method==='GET'){const item=store.get(match[1]);if(!item)throw new AppError(404,'资料不存在。');return json(res,200,{item});}
         if(req.method==='PATCH'){
-          const old=store.get(match[1]);if(!old)throw new AppError(404,'资料不存在。');const input=await bodyJSON(req);
+          const input=await bodyJSON(req),old=store.get(match[1]);if(!old)throw new AppError(404,'资料不存在。');
           if(input.category&&!CATEGORIES.includes(input.category))throw new AppError(400,'分类无效。');
           const title=input.title??old.title,note=input.note??old.note,tags=input.tags??old.tags;
           if(typeof title!=='string'||!title.trim()||title.length>240||typeof note!=='string'||note.length>12000||!Array.isArray(tags)||tags.some(x=>typeof x!=='string'||x.length>80)||tags.length>40)throw new AppError(400,'资料信息格式无效。');
-          store.db.prepare('UPDATE library_resources SET title=?,category=?,note=?,tags_json=?,updated_at=? WHERE id=?').run(title.trim(),input.category||old.category,note,JSON.stringify(tags),new Date().toISOString(),old.id);return json(res,200,{item:store.get(old.id)});
+          store.db.prepare('UPDATE library_resources SET title=?,category=?,kind=?,note=?,tags_json=?,updated_at=? WHERE id=?').run(title.trim(),input.category||old.category,input.category?kindFor(input.category,title,old.ingestion?.format||(old.pdf?'pdf':'')):old.kind,note,JSON.stringify(tags),new Date().toISOString(),old.id);
+          if(input.category)store.db.prepare("UPDATE library_ingestion SET category_mode='manual',needs_review=0,confidence='manual',reason='已由使用者确认分类。' WHERE resource_id=?").run(old.id);
+          return json(res,200,{item:store.get(old.id)});
         }
+      }
+      if((match=url.pathname.match(/^\/api\/library\/resources\/(kb_[a-zA-Z0-9_-]+)\/reparse$/))&&req.method==='POST'){
+        const item=store.get(match[1]);if(!item)throw new AppError(404,'资料不存在。');
+        if(!item.assets.some(a=>a.role==='primary'))throw new AppError(400,'这条索引没有可解析的本地原件。');
+        if(['queued','parsing'].includes(item.ingestion?.status))throw new AppError(409,'这份资料已在解析队列中。');
+        ingestion.enqueue(item.id,{mode:item.ingestion?.categoryMode||'manual'});return json(res,202,{item:store.get(item.id)});
       }
       if((match=url.pathname.match(/^\/api\/library\/assets\/(asset_[a-zA-Z0-9_-]+)$/))&&['GET','HEAD'].includes(req.method)){
         const asset=store.asset(match[1]);if(!asset)throw new AppError(404,'附件不存在。');
@@ -80,6 +98,6 @@ function createLibraryApp({dataDir=path.join(__dirname,'.data'),staticDir=__dirn
     }catch(e){if(!res.headersSent&&!res.destroyed)json(res,e.status||500,{error:e instanceof AppError?e.message:'本地资料服务处理失败。'});}
   });
   server.requestTimeout=10*60*1000;
-  return {server,store,async close(){if(server.listening)await new Promise(r=>server.close(r));store.close();}};
+  return {server,store,ingestion,async close(){await ingestion.close();if(server.listening)await new Promise(r=>server.close(r));store.close();}};
 }
 module.exports={createLibraryApp,rangeOf};

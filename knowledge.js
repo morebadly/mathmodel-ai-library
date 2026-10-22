@@ -10,11 +10,13 @@
     stats:()=>request('/api/library/stats'),
     list:filters=>request('/api/library/resources?'+new URLSearchParams(Object.entries(filters||{}).filter(([,v])=>v!==''&&v!=null))),
     get:async id=>(await request('/api/library/resources/'+encodeURIComponent(id))).item,
+    ingestion:()=>request('/api/library/ingestion'),
+    reparse:id=>request('/api/library/resources/'+encodeURIComponent(id)+'/reparse',{method:'POST'}),
     async upload(file,metadata){
       const tags=String(metadata.tags||'').split(/[,，;；\s]+/).filter(Boolean),note=String(metadata.description||'');
       if(tags.length>40||tags.some(x=>x.length>80))throw new Error('标签最多 40 个，每个不超过 80 字。');
       if(note.length>12000)throw new Error('资料说明不能超过 12,000 字。');
-      const data=await request('/api/library/resources?'+new URLSearchParams({name:file.name,category:metadata.category}),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file,signal:AbortSignal.timeout(10*60*1000)});
+      const data=await request('/api/library/resources?'+new URLSearchParams({name:file.name,category:metadata.category||'auto'}),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file,signal:AbortSignal.timeout(10*60*1000)});
       if(tags.length||note)await this.update(data.item.id,{tags,note});
       return data;
     },

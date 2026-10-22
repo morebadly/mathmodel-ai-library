@@ -60,7 +60,7 @@
   function projectDialog(){showDialog('新建建模项目',field('项目名称','title','text','','',true)+area('问题描述','description','','写下真实的问题背景、已知条件和目标，可稍后补充。'),{formId:'project-form',submit:'创建项目'});}
   function importDialog(kind,linkId=''){
     pendingFiles=[];const isKnowledge=kind==='knowledge',isPaper=kind==='paper';
-    showDialog(isKnowledge?'导入本地知识资料':isPaper?'上传论文原件':'添加真实附件',`<div class="import-zone" id="drop-zone">${I('upload')}<strong>选择文件，或将文件拖到这里</strong><p>${isKnowledge?'原件存入本地资料库，单文件不超过 1 GB；文本和 HTML 不超过 20 MB。':'保留原文件，单个文件不超过 50 MB；每批不超过 150 MB。'}</p>${act('pick-files','选择本地文件','plus','small')}<input id="file-input" type="file" multiple hidden accept=".html,.htm,.rar,.pdf,.doc,.docx,.ppt,.pptx,.txt,.md,.markdown,.tex,.bib,.csv,.tsv,.json,.py,.m,.r,.js,.ipynb,.xlsx,.xls,.zip,.mp4,.webm,.mp3,.wav,.srt,.vtt"></div><div id="selected-files" class="selected-files"></div>${isKnowledge?select('知识分类（请自行指定）','category',['请选择分类',...M.categories],'请选择分类')+field('标签','tags','text','','用逗号或空格分隔，便于后续检索。')+area('资料说明','description'):'<p class="field-note">论文、数据与代码仅保存在本机，不会自动进入共享知识库，也不会自动发送到模型服务。</p>'}${isPaper?`<div class="form-field"><label for="f-projectId">关联建模项目（可选）</label><select id="f-projectId" name="projectId"><option value="">暂不关联</option>${state.projects.map(p=>`<option value="${p.id}">${E(p.title)}</option>`).join('')}</select></div>`:''}<p class="field-note">${isKnowledge?'PDF 可直接预览；文本和代码可阅读，Word、课件、表格与压缩包保留原件供下载。':'TXT、Markdown、LaTeX、CSV 和代码等 UTF-8 文本可直接读取（上限 5 MB）；其他格式保留原件。'}</p>`,{formId:'import-form',submit:'导入所选文件',context:{kind,linkId}});
+    showDialog(isKnowledge?'导入本地知识资料':isPaper?'上传论文原件':'添加真实附件',`<div class="import-zone" id="drop-zone">${I('upload')}<strong>选择文件，或将文件拖到这里</strong><p>${isKnowledge?'原件最多 1 GB；自动解析单份文档最多 64 MB，文本和 HTML 最多 20 MB。':'保留原文件，单个文件不超过 50 MB；每批不超过 150 MB。'}</p>${act('pick-files','选择本地文件','plus','small')}<input id="file-input" type="file" multiple hidden accept=".html,.htm,.rar,.pdf,.doc,.docx,.ppt,.pptx,.rtf,.odt,.odp,.ods,.txt,.md,.markdown,.tex,.bib,.csv,.tsv,.json,.py,.m,.r,.js,.ts,.tsx,.jsx,.c,.cpp,.h,.java,.jl,.sql,.sh,.ipynb,.xlsx,.xls,.zip,.mp4,.webm,.mp3,.wav,.srt,.vtt"></div><div id="selected-files" class="selected-files"></div>${isKnowledge?select('知识分类','category',['自动识别（按原六类）',...M.categories],'自动识别（按原六类）')+field('标签','tags','text','','用逗号或空格分隔，便于后续检索。')+area('资料说明','description'):'<p class="field-note">论文、数据与代码仅保存在本机，不会自动进入共享知识库，也不会自动发送到模型服务。</p>'}${isPaper?`<div class="form-field"><label for="f-projectId">关联建模项目（可选）</label><select id="f-projectId" name="projectId"><option value="">暂不关联</option>${state.projects.map(p=>`<option value="${p.id}">${E(p.title)}</option>`).join('')}</select></div>`:''}<p class="field-note">${isKnowledge?'上传后后台提取 PDF、Word、PPTX、XLSX 和文本正文并自动归类。扫描件需 OCR；ZIP 保留原包，不自动展开。也可自行指定分类。':'TXT、Markdown、LaTeX、CSV 和代码等 UTF-8 文本可直接读取（上限 5 MB）；其他格式保留原件。'}</p>`,{formId:'import-form',submit:'导入所选文件',context:{kind,linkId}});
   }
   function updateFileList(files){
     const selected=Array.from(files),knowledge=dialogContext.kind==='knowledge';if(selected.some(f=>f.size>(knowledge?1024:50)*1024*1024)){toast(knowledge?'单文件不能超过 1 GB，请先拆分资料。':'存在超过 50 MB 的文件，请分开处理或压缩后导入。',true);return;}
@@ -70,12 +70,12 @@
   async function importFiles(form){
     if(!pendingFiles.length)throw new Error('请先选择需要导入的本地文件。');
     const {kind,linkId}=dialogContext,category=form.get('category');
-    if(kind==='knowledge'&&!M.categories.includes(category))throw new Error('请为这些资料指定知识分类。');
+    if(kind==='knowledge'&&category!=='自动识别（按原六类）'&&!M.categories.includes(category))throw new Error('请为这些资料指定知识分类。');
     if(kind==='knowledge'){
       const selected=[...pendingFiles];let imported=0;
-      try{for(const file of selected){await M.library.upload(file,{category,tags:form.get('tags'),description:form.get('description')});imported++;if($('#selected-files'))$('#selected-files').innerHTML=`<p>已保存 ${imported} / ${selected.length} 份资料。</p>`;}}
+      try{for(const file of selected){await M.library.upload(file,{category:category==='自动识别（按原六类）'?'auto':category,tags:form.get('tags'),description:form.get('description')});imported++;if($('#selected-files'))$('#selected-files').innerHTML=`<p>已保存 ${imported} / ${selected.length} 份资料。</p>`;}}
       finally{await window.LibraryUI.refresh();}
-      modal.close();pendingFiles=[];event('导入 '+imported+' 份本地知识资料');await persist();go('knowledge');toast('已导入 '+imported+' 份资料，可阅读或下载原件。');return;
+      modal.close();pendingFiles=[];event('导入 '+imported+' 份本地知识资料');await persist();go('knowledge');toast('已导入 '+imported+' 份原件，正文正在后台自动解析，可在知识库查看状态。');return;
     }
     const projectId=kind==='paper'?form.get('projectId'):kind==='attachment'?linkId:'';
     const targetProject=state.projects.find(p=>p.id===projectId),targetTask=state.tasks.find(t=>t.id===linkId);
