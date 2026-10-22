@@ -1,0 +1,6 @@
+.data/
+.runtime/
+node_modules/
+*.log
+.env
+.env.local

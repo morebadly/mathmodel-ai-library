@@ -1,0 +1,9 @@
+* text=auto
+*.png binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.bcmap binary
+*.wasm binary
+*.icc binary
+*.pfb binary
